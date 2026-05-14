@@ -7,6 +7,7 @@ import torch
 # from verl.utils.reward_score import rag, ppl, rag_new
 # from verl.utils.reward_score import rag_new
 from verl.utils.reward_score import rag_2
+from verl.utils.reward_score import finqa_exec_acc
 # from verl.utils.reward_score import ret
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 import re
@@ -23,6 +24,10 @@ USE_GENERATION_SCORE = True
 
 
 def _select_rm_score_fn(data_source):
+        # FinQA numeric exec_acc — used when data.parquet rows have data_source="finqa_exec_acc"
+        if data_source == "finqa_exec_acc":
+            return finqa_exec_acc.compute_score_finqa_rag
+        # Default: s3 paper's RAG generator-acc reward (Qwen LLMJudge)
         return rag_2.compute_score_rag
 
 

@@ -66,7 +66,7 @@ def _numeric_match(prediction_text: str, gold) -> bool:
 
 def compute_score_finqa(solution_str, ground_truth, method="strict",
                          format_score=0.0, score=1.0):
-    """The scoring function for FinQA exec_acc.
+    """The scoring function for FinQA exec_acc (simple float return).
 
     Args:
         solution_str: the trajectory text emitted by the s3 search agent
@@ -86,3 +86,23 @@ def compute_score_finqa(solution_str, ground_truth, method="strict",
     if _numeric_match(pred_text, ground_truth):
         return score
     return format_score
+
+
+def compute_score_finqa_rag(
+    solution_str,
+    ground_truth,
+    zeroshot_answers=None,
+    data_source=None,
+    use_utility_score=True,
+    use_generation_score=True,
+):
+    """VERL RewardManager-compatible wrapper.
+
+    Matches rag_2.compute_score_rag signature:
+        returns (score, answer_zeroshot, answer_zeroshot_score)
+    The latter two are unused for FinQA (we don't compute a generator
+    zero-shot baseline at reward time; that's handled by the naive_correct
+    precompute embedded in the parquet's data_source filtering).
+    """
+    s = compute_score_finqa(solution_str, ground_truth)
+    return s, None, None
