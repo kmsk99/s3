@@ -149,3 +149,5 @@ evaluate_check.sh
 *.csv
 *.ipynb
 *.pdf
+# Local OMX runtime state
+.omc/
