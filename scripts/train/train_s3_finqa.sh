@@ -25,8 +25,10 @@ N_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
 export DATA_DIR=data/finqa_s3
 WAND_PROJECT="FinQA-s3"
 
-# Paper §A.2 uses Qwen2.5-7B-Instruct. We match.
-export BASE_MODEL=${BASE_MODEL:-'Qwen/Qwen2.5-7B-Instruct'}
+# RQ2/RQ3 use Qwen3-4B for cross-RQ consistency in our thesis.
+# Paper §A.2 used Qwen2.5-7B-Instruct; we deviate intentionally to stay on the
+# same backbone family as our other research questions.
+export BASE_MODEL=${BASE_MODEL:-'Qwen/Qwen3-4B'}
 export EXPERIMENT_NAME="s3_finqa_8_3_3_${RANDOM_SEED}"
 export VLLM_ATTENTION_BACKEND=XFORMERS
 
@@ -46,7 +48,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=$BASE_MODEL \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.enable_gradient_checkpointing=true \
-    actor_rollout_ref.model.use_remove_padding=True \
+    actor_rollout_ref.model.use_remove_padding=False \
     actor_rollout_ref.actor.optim.lr_warmup_steps_ratio=0 \
     actor_rollout_ref.actor.ppo_mini_batch_size=30 \
     actor_rollout_ref.actor.ppo_micro_batch_size=15 \
@@ -61,7 +63,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.state_masking=true \
     critic.optim.lr=1e-5 \
-    critic.model.use_remove_padding=True \
+    critic.model.use_remove_padding=False \
     critic.optim.lr_warmup_steps_ratio=0.01 \
     critic.model.path=$BASE_MODEL \
     critic.model.enable_gradient_checkpointing=true \
