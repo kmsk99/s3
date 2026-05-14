@@ -150,22 +150,25 @@ def naive_rag_correct(item: Dict[str, Any], topk: int,
         return False
 
 
-def build_prompt(item: Dict[str, Any], initial_docs: List[Dict[str, Any]]) -> str:
-    """Compose the prompt the s3 search agent sees at turn 1.
+def build_prompt(item: Dict[str, Any], initial_docs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Compose chat messages for the s3 search agent.
 
-    Includes the system prompt + initial naive RAG retrieval + the question
-    wrapped in <question> tags so generation_s3.py can recover it.
+    Returns list[{role,content}] consumed by tokenizer.apply_chat_template
+    (rl_dataset.py expects this exact shape).
     """
     question = item["qa"]["question"]
     context = passages_to_string(initial_docs)
-    user = (
+    user_content = (
         f"<question>{question}</question>\n\n"
         f"Initial retrieval (naive RAG top-{len(initial_docs)}):\n"
         f"<information>{context}</information>\n\n"
         "Decide whether the searched results are enough. Emit the strict "
         "tag sequence."
     )
-    return f"<|im_start|>system\n{S3_SYSTEM_PROMPT}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+    return [
+        {"role": "system", "content": S3_SYSTEM_PROMPT},
+        {"role": "user", "content": user_content},
+    ]
 
 
 def main():
@@ -257,16 +260,21 @@ def main():
                 continue
             prompt = build_prompt(it, initial)
             ground_truth = it["qa"].get("exe_ans", it["qa"].get("answer"))
+            gt_str = str(ground_truth)
             rows.append({
                 "prompt": prompt,
-                "ground_truth": str(ground_truth),
                 "data_source": "finqa_exec_acc",
-                "extra_info": json.dumps({
+                "reward_model": {
+                    "style": "finqa_exec_acc",
+                    "ground_truth": gt_str,
+                },
+                "extra_info": {
+                    "split": split_name,
+                    "index": len(rows),
                     "question": it["qa"]["question"],
-                    "golden_answers": [str(ground_truth)],
+                    "golden_answers": [gt_str],
                     "doc_id": it["id"],
-                    "gold_inds": it["qa"].get("gold_inds", {}),
-                }),
+                },
             })
         if not rows:
             print(f"  no rows for {split_name}")
