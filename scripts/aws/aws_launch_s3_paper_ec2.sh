@@ -1,13 +1,16 @@
 #!/bin/bash
 # Launch p4d.24xlarge for s3 paper PPO training on FinQA.
 #
-# Single instance hosts:
-#   - Weaviate (Docker, port 8080)
-#   - finqa_retrieval_adapter (FastAPI, port 3000)
-#   - finqa_generator_adapter (FastAPI, port 8000 — calls Bedrock Kimi K2.5)
-#   - VERL PPO training on GPUs 1-7
+# v2: Removed conda dependency (DLAMI 2026 has no conda in PATH for ubuntu user).
+#     Uses uv to create separate Python 3.10 venv for VERL.
+#     Restores Weaviate from S3 snapshot (no in-EC2 ingest).
+#     Pulls parquet from S3 (no in-EC2 generation).
 #
-# Prerequisites: aws_provision.sh has been run.
+# Single instance hosts:
+#   - Weaviate (Docker, port 8080, restored from snapshot)
+#   - finqa_retrieval_adapter (FastAPI, port 3000)
+#   - finqa_generator_adapter (FastAPI, port 8000 → Bedrock Kimi K2.5)
+#   - VERL PPO training on all 8 GPUs
 
 set -euo pipefail
 
@@ -63,43 +66,63 @@ BOOTSTRAP=$(mktemp)
 cat > "$BOOTSTRAP" <<EOF
 #!/bin/bash
 exec > /var/log/s3-paper-bootstrap.log 2>&1
-set -e
+set -eo pipefail
 
 echo "[bootstrap] start: \$(date)"
 cd /home/ubuntu
 
-# 1. Pull code tarballs from S3 (pitfall #12: private repo workaround)
+# 1. Code tarballs from S3 (pitfall #12 — private repo workaround)
 sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/fin-qa-research /home/ubuntu/s3"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/fin-qa-code.tar.gz /home/ubuntu/fin-qa-code.tar.gz"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/s3-paper-code.tar.gz /home/ubuntu/s3-paper-code.tar.gz"
 sudo -u ubuntu bash -c "cd /home/ubuntu/fin-qa-research && tar -xzf /home/ubuntu/fin-qa-code.tar.gz"
 sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && tar -xzf /home/ubuntu/s3-paper-code.tar.gz"
 sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/fin-qa-research/dataset"
+echo "[bootstrap] code extracted: \$(date)"
 
-# 2. uv-based finqa venv (pitfall #7-8)
+# 2. Install uv (pitfall #8 — uv handles venv paths cleanly)
 sudo -u ubuntu bash -c "curl -LsSf https://astral.sh/uv/install.sh | sh"
+
+# 3. FinQA venv (Python 3.12, fin-qa-research/pyproject.toml)
 sudo -u ubuntu bash -c "cd /home/ubuntu/fin-qa-research && /home/ubuntu/.local/bin/uv sync --no-dev"
-sudo -u ubuntu bash -c "source /home/ubuntu/fin-qa-research/.venv/bin/activate && /home/ubuntu/.local/bin/uv pip install fastapi uvicorn pyarrow boto3 'transformers>=4.51'"
+# Add adapter deps (fastapi + uvicorn[standard] + pyarrow)
+sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/fin-qa-research/.venv/bin/python fastapi 'uvicorn[standard]' pyarrow"
+echo "[bootstrap] finqa venv ready: \$(date)"
 
-# 3. Conda s3 env (paper's stack)
-sudo -u ubuntu bash -c "conda env create -f /home/ubuntu/s3/environment_s3.yml || conda env update -f /home/ubuntu/s3/environment_s3.yml"
-sudo -u ubuntu bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate s3 && pip install -e /home/ubuntu/s3"
+# 4. VERL venv (Python 3.10, s3 paper deps — NO CONDA)
+sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && /home/ubuntu/.local/bin/uv venv --python 3.10 .venv-verl"
+sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python --index-url https://download.pytorch.org/whl/cu121 torch==2.4.0"
+sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python 'vllm==0.6.3' 'transformers<4.48' accelerate 'tensordict<0.6' hydra-core ray wandb codetiming datasets dill pybind11 IPython matplotlib pandas numpy pyarrow"
+# flash-attn requires --no-build-isolation; pre-built wheel from PyPI if CUDA matches
+export CUDA_HOME=/usr/local/cuda
+sudo -u ubuntu bash -c "CUDA_HOME=/usr/local/cuda /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python --no-build-isolation flash-attn"
+# Install s3 paper as editable package (gives access to verl + s3 modules)
+sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python -e /home/ubuntu/s3"
+echo "[bootstrap] verl venv ready: \$(date)"
 
-# 4. Weaviate (pitfall #6: docker compose v2)
+# 5. Weaviate via docker compose v2 (pitfall #6)
 sudo -u ubuntu bash -c "cd /home/ubuntu/fin-qa-research && docker compose up -d weaviate-finqa"
 sleep 15
 
-# 5. Pull FinQA dataset + naive_correct (if exists)
+# 6. Restore Weaviate volume from snapshot (skips ~25 min ingest)
+sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/weaviate-snapshot.tar.gz /home/ubuntu/weaviate-snapshot.tar.gz"
+sudo -u ubuntu bash -c "cd /home/ubuntu/fin-qa-research && docker compose stop weaviate-finqa"
+# Extract into the named volume
+docker run --rm -v fin-qa-research_weaviate_data_none:/data -v /home/ubuntu:/backup alpine sh -c "rm -rf /data/* && tar -xzf /backup/weaviate-snapshot.tar.gz -C /data"
+sudo -u ubuntu bash -c "cd /home/ubuntu/fin-qa-research && docker compose up -d weaviate-finqa"
+sleep 20
+# Verify collection present
+curl -fsS http://127.0.0.1:8080/v1/schema | python3 -c "import sys,json; cs=json.loads(sys.stdin.read()).get('classes',[]); ok=any(c['class']=='FinQA_Chunking_Markdown' for c in cs); print(f'collections: {[c[\"class\"] for c in cs]}'); exit(0 if ok else 1)"
+echo "[bootstrap] weaviate restored: \$(date)"
+
+# 7. Pull pre-generated parquet + naive_correct cache + FinQA dataset from S3
+sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/s3/data/finqa_s3 && aws s3 sync s3://$S3_BUCKET/finqa_s3/ /home/ubuntu/s3/data/finqa_s3/"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/dataset/train.json /home/ubuntu/fin-qa-research/dataset/train.json"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/dataset/dev.json /home/ubuntu/fin-qa-research/dataset/dev.json"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/dataset/test.json /home/ubuntu/fin-qa-research/dataset/test.json"
-sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/s3/data/finqa_s3 && (aws s3 sync s3://$S3_BUCKET/finqa_s3/ /home/ubuntu/s3/data/finqa_s3/ || true)"
+echo "[bootstrap] data ready: \$(date)"
 
-# 6. Ingest FinQA into Weaviate
-cd /home/ubuntu/fin-qa-research/src/nr-pb-step-4-s3-integrated-policy
-sudo -u ubuntu bash -c "WEAVIATE_URL=http://127.0.0.1:8080 SKIP_DOCKER_MANAGEMENT=1 /home/ubuntu/fin-qa-research/.venv/bin/python code/ingest.py --train"
-
-# 7. Spot interrupt handler (pitfall #10: HTTP 200 only)
+# 8. Spot interrupt handler (pitfall #10 — HTTP 200 only)
 cat > /home/ubuntu/spot-watch.sh <<'WATCH'
 #!/bin/bash
 while true; do
@@ -119,26 +142,21 @@ if [ "$PURCHASE" = "spot" ]; then
     sudo -u ubuntu bash -c "/home/ubuntu/spot-watch.sh &"
 fi
 
-# 8. Start FinQA retrieval adapter (port 3000)
-sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && WEAVIATE_URL=http://127.0.0.1:8080 FINQA_REPO_ROOT=/home/ubuntu/fin-qa-research nohup /home/ubuntu/fin-qa-research/.venv/bin/uvicorn integrations.finqa_retrieval_adapter:app --host 0.0.0.0 --port 3000 --workers 2 > /home/ubuntu/retrieval-adapter.log 2>&1 &"
+# 9. Start FinQA retrieval adapter on port 3000 (uses finqa venv)
+sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && WEAVIATE_URL=http://127.0.0.1:8080 FINQA_REPO_ROOT=/home/ubuntu/fin-qa-research AWS_REGION=us-east-1 nohup /home/ubuntu/fin-qa-research/.venv/bin/python -m uvicorn integrations.finqa_retrieval_adapter:app --host 0.0.0.0 --port 3000 --workers 4 > /home/ubuntu/retrieval-adapter.log 2>&1 &"
 
-# 9. Start FinQA generator adapter (port 8000)
-sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && AWS_REGION=us-east-1 FINQA_REPO_ROOT=/home/ubuntu/fin-qa-research nohup /home/ubuntu/fin-qa-research/.venv/bin/uvicorn integrations.finqa_generator_adapter:app --host 0.0.0.0 --port 8000 --workers 2 > /home/ubuntu/generator-adapter.log 2>&1 &"
+# 10. Start FinQA generator adapter on port 8000 (uses finqa venv)
+sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && AWS_REGION=us-east-1 FINQA_REPO_ROOT=/home/ubuntu/fin-qa-research nohup /home/ubuntu/fin-qa-research/.venv/bin/python -m uvicorn integrations.finqa_generator_adapter:app --host 0.0.0.0 --port 8000 --workers 4 > /home/ubuntu/generator-adapter.log 2>&1 &"
 
 sleep 20
 
-# 10. Health check
-curl -fsS http://127.0.0.1:3000/health || (echo "retrieval adapter down"; exit 1)
-curl -fsS http://127.0.0.1:8000/health || (echo "generator adapter down"; exit 1)
+# 11. Health checks
+curl -fsS http://127.0.0.1:3000/health || (echo "retrieval adapter down"; cat /home/ubuntu/retrieval-adapter.log; exit 1)
+curl -fsS http://127.0.0.1:8000/health || (echo "generator adapter down"; cat /home/ubuntu/generator-adapter.log; exit 1)
+echo "[bootstrap] adapters healthy: \$(date)"
 
-# 11. Prepare FinQA parquet (if not already in S3)
-if [ ! -f /home/ubuntu/s3/data/finqa_s3/train_finqa_s3.parquet ]; then
-    sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && /home/ubuntu/fin-qa-research/.venv/bin/python integrations/prepare_finqa_dataset.py --finqa-dir /home/ubuntu/fin-qa-research/dataset --out-dir data/finqa_s3 --workers 8"
-    sudo -u ubuntu bash -c "aws s3 sync /home/ubuntu/s3/data/finqa_s3/ s3://$S3_BUCKET/finqa_s3/"
-fi
-
-# 12. Launch VERL PPO training on GPUs 1-7 (paper §A.2 used 5 GPUs; we have 7 available)
-sudo -u ubuntu bash -c "source /opt/conda/etc/profile.d/conda.sh && conda activate s3 && cd /home/ubuntu/s3 && VERL_GPUS=1,2,3,4,5,6,7 TOTAL_STEPS=$TOTAL_STEPS GENERATOR_LLM_URL=http://127.0.0.1:8000/v1/chat/completions RETRIEVER_URL=http://127.0.0.1:3000/retrieve bash scripts/train/train_s3_finqa.sh 2>&1 | tee /home/ubuntu/s3-train.log"
+# 12. Launch VERL PPO training (verl venv, all 8 GPUs)
+sudo -u ubuntu bash -c "source /home/ubuntu/s3/.venv-verl/bin/activate && cd /home/ubuntu/s3 && VERL_GPUS=0,1,2,3,4,5,6,7 TOTAL_STEPS=$TOTAL_STEPS GENERATOR_LLM_URL=http://127.0.0.1:8000/v1/chat/completions RETRIEVER_URL=http://127.0.0.1:3000/retrieve bash scripts/train/train_s3_finqa.sh 2>&1 | tee /home/ubuntu/s3-train.log"
 
 echo "[bootstrap] training finished: \$(date)"
 

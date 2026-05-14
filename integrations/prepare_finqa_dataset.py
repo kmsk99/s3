@@ -181,6 +181,10 @@ def main():
                         help="Restrict to questions where naive RAG fails (s3 paper line 423)")
     parser.add_argument("--skip-precompute", action="store_true",
                         help="Skip naive-RAG precompute, assume cache exists")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Cap each split at N items (smoke testing)")
+    parser.add_argument("--splits", type=str, default="train,valid,test",
+                        help="Comma-separated splits to emit (subset of train,valid,test)")
     args = parser.parse_args()
 
     if not HAVE_PYARROW:
@@ -229,10 +233,15 @@ def main():
           f"{sum(cache.values())/max(len(cache),1)*100:.1f}%")
 
     # Build parquet for each split.
+    selected_splits = {s.strip() for s in args.splits.split(",") if s.strip()}
     for split_name, p in splits.items():
+        if split_name not in selected_splits:
+            continue
         if not p.exists():
             continue
         items = load_finqa(p)
+        if args.limit:
+            items = items[: args.limit]
         rows = []
         for it in items:
             if split_name == "train" and args.hard_only:
