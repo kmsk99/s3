@@ -92,10 +92,13 @@ echo "[bootstrap] finqa venv ready: \$(date)"
 # 4. VERL venv (Python 3.10, s3 paper deps — NO CONDA)
 sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && /home/ubuntu/.local/bin/uv venv --python 3.10 .venv-verl"
 sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python --index-url https://download.pytorch.org/whl/cu121 torch==2.4.0"
+# Build dependencies must be installed BEFORE --no-build-isolation packages (e.g., flash-attn)
+sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python setuptools wheel packaging ninja"
 sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python 'vllm==0.6.3' 'transformers<4.48' accelerate 'tensordict<0.6' hydra-core ray wandb codetiming datasets dill pybind11 IPython matplotlib pandas numpy pyarrow"
-# flash-attn requires --no-build-isolation; pre-built wheel from PyPI if CUDA matches
+# flash-attn is OPTIONAL — vLLM uses VLLM_ATTENTION_BACKEND=XFORMERS, HF actor/critic use sdpa.
+# If build fails (common on DLAMI without matching cuDNN), skip and let HF fall back.
 export CUDA_HOME=/usr/local/cuda
-sudo -u ubuntu bash -c "CUDA_HOME=/usr/local/cuda /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python --no-build-isolation flash-attn"
+sudo -u ubuntu bash -c "CUDA_HOME=/usr/local/cuda /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python --no-build-isolation flash-attn" || echo "[bootstrap] flash-attn skipped (using sdpa/xformers fallback)"
 # Install s3 paper as editable package (gives access to verl + s3 modules)
 sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python -e /home/ubuntu/s3"
 echo "[bootstrap] verl venv ready: \$(date)"

@@ -6,7 +6,8 @@ from verl import DataProto
 import torch
 # from verl.utils.reward_score import rag, ppl, rag_new
 # from verl.utils.reward_score import rag_new
-from verl.utils.reward_score import rag_2
+# Lazy imports for rag_2 and generator_llms — they pull boto3+pyserini+Java+keyfiles at module load,
+# which we don't need on the FinQA path. Imported only when actually invoked.
 from verl.utils.reward_score import finqa_exec_acc
 # from verl.utils.reward_score import ret
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
@@ -17,7 +18,6 @@ import numpy as np
 import threading
 import random
 
-from verl.utils.reward_score.rag_2 import output_sequence
 
 USE_UTILITY_SCORE = True
 USE_GENERATION_SCORE = True
@@ -27,8 +27,15 @@ def _select_rm_score_fn(data_source):
         # FinQA numeric exec_acc — used when data.parquet rows have data_source="finqa_exec_acc"
         if data_source == "finqa_exec_acc":
             return finqa_exec_acc.compute_score_finqa_rag
-        # Default: s3 paper's RAG generator-acc reward (Qwen LLMJudge)
+        # Default: s3 paper's RAG generator-acc reward (lazy import to avoid eager boto3/pyserini load)
+        from verl.utils.reward_score import rag_2
         return rag_2.compute_score_rag
+
+
+def _output_sequence(*args, **kwargs):
+    # Lazy wrapper around rag_2.output_sequence (only invoked in val_only branch).
+    from verl.utils.reward_score.rag_2 import output_sequence
+    return output_sequence(*args, **kwargs)
 
 
 class RewardManager():
@@ -122,7 +129,7 @@ class RewardManager():
                 
             else:
                 print(f"start output sequence")
-                question, golden_answers, context_with_info, response_str = output_sequence(solution_str=sequences_str, ground_truth=ground_truth)
+                question, golden_answers, context_with_info, response_str = _output_sequence(solution_str=sequences_str, ground_truth=ground_truth)
                 print(f"output sequence end")
                 score = 0
                 
