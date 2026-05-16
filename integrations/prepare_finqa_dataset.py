@@ -324,6 +324,87 @@ def build_prompt(item: Dict[str, Any], initial_docs: List[Dict[str, Any]]) -> Li
     ]
 
 
+def build_parquet_row(
+    item: Dict[str, Any],
+    split_name: str,
+    row_index: int,
+    topk: int,
+    retrieval_url: str,
+) -> Optional[Dict[str, Any]]:
+    """Retrieve initial docs and build one s3 parquet row."""
+    try:
+        initial = retrieve_initial(
+            item["qa"]["question"], item["id"], topk, retrieval_url
+        )
+    except Exception as e:
+        print(f"  retrieve err {item['id']}: {e}")
+        return None
+    prompt = build_prompt(item, initial)
+    ground_truth = item["qa"].get("exe_ans", item["qa"].get("answer"))
+    gt_str = str(ground_truth)
+    return {
+        "prompt": prompt,
+        "data_source": "finqa_exec_acc",
+        "reward_model": {
+            "style": "finqa_exec_acc",
+            "ground_truth": gt_str,
+        },
+        "extra_info": {
+            "split": split_name,
+            "index": row_index,
+            "question": item["qa"]["question"],
+            "golden_answers": [gt_str],
+            "doc_id": item["id"],
+        },
+    }
+
+
+def build_rows_parallel(
+    items: List[Dict[str, Any]],
+    split_name: str,
+    topk: int,
+    retrieval_url: str,
+    workers: int,
+) -> List[Dict[str, Any]]:
+    """Build parquet rows with bounded retrieval concurrency."""
+    rows_by_index: Dict[int, Dict[str, Any]] = {}
+    max_pending = max(1, workers * 2)
+    done_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        pending: Dict[Any, int] = {}
+        iterator = iter(enumerate(items))
+
+        def fill_pending() -> None:
+            while len(pending) < max_pending:
+                try:
+                    idx, item = next(iterator)
+                except StopIteration:
+                    break
+                fut = ex.submit(
+                    build_parquet_row,
+                    item, split_name, idx, topk, retrieval_url,
+                )
+                pending[fut] = idx
+
+        fill_pending()
+        while pending:
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for fut in done:
+                idx = pending.pop(fut)
+                row = fut.result()
+                done_count += 1
+                if row is not None:
+                    rows_by_index[idx] = row
+                if done_count % 100 == 0:
+                    print(
+                        f"  {split_name}: {done_count}/{len(items)} initial retrieval done, "
+                        f"rows so far: {len(rows_by_index)}"
+                    )
+            fill_pending()
+
+    return [rows_by_index[i] for i in sorted(rows_by_index)]
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--finqa-dir", type=Path, required=True,
@@ -445,37 +526,17 @@ def main():
         items = load_finqa(p)
         if args.limit:
             items = items[: args.limit]
-        rows = []
+        candidates = []
         for it in items:
             if split_name == "train" and args.hard_only:
                 k = question_key(it)
                 if cache.get(k, False):
                     continue
-            try:
-                initial = retrieve_initial(
-                    it["qa"]["question"], it["id"], args.topk, args.retrieval_url
-                )
-            except Exception as e:
-                print(f"  retrieve err {it['id']}: {e}")
-                continue
-            prompt = build_prompt(it, initial)
-            ground_truth = it["qa"].get("exe_ans", it["qa"].get("answer"))
-            gt_str = str(ground_truth)
-            rows.append({
-                "prompt": prompt,
-                "data_source": "finqa_exec_acc",
-                "reward_model": {
-                    "style": "finqa_exec_acc",
-                    "ground_truth": gt_str,
-                },
-                "extra_info": {
-                    "split": split_name,
-                    "index": len(rows),
-                    "question": it["qa"]["question"],
-                    "golden_answers": [gt_str],
-                    "doc_id": it["id"],
-                },
-            })
+            candidates.append(it)
+        print(f"Building {split_name} parquet rows from {len(candidates)} candidates with {args.workers} workers...")
+        rows = build_rows_parallel(
+            candidates, split_name, args.topk, args.retrieval_url, args.workers
+        )
         if not rows:
             print(f"  no rows for {split_name}")
             continue
