@@ -24,12 +24,57 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
+
 # Step 4 + finqa_common are imported lazily to avoid module-load failures
 # on machines that haven't installed them.
 _LAZY_IMPORTED = False
 _BEDROCK_CLIENT = None
 _WEAVIATE_CLIENT = None
 _INIT_LOCK = threading.Lock()
+_STEP4_CACHE: Dict[str, Any] = {
+    "train_norms": None,
+    "train_exemplars": None,
+    "train_doc_ids": None,
+    "embedding_by_key": None,
+}
+
+
+def _prepare_step4_cache(phaseb_inference) -> None:
+    """Mirror Step 4 exemplar state into reward-local fast lookup structures.
+
+    The original Step 4 code already preloads all train question embeddings into
+    memory for similarity-based few-shot selection. During FinQA train
+    naive_correct precompute, the query is itself a train question, so calling
+    Titan embedding again for every item is redundant. We keep the same exemplar
+    selection semantics but cache:
+
+    - normalized train embedding matrix, avoiding per-call normalization;
+    - doc_id::question -> embedding, avoiding per-train-question Titan calls.
+    """
+    state = getattr(phaseb_inference, "_fsp_state", {})
+    train_embeddings = state.get("train_embeddings")
+    train_exemplars = state.get("train_exemplars")
+    train_doc_ids = state.get("train_doc_ids")
+    if train_embeddings is None or train_exemplars is None or train_doc_ids is None:
+        return
+    if len(train_embeddings) == 0:
+        return
+
+    train_arr = np.asarray(train_embeddings)
+    norms = np.linalg.norm(train_arr, axis=1, keepdims=True) + 1e-10
+    embedding_by_key = {}
+    for i, (doc_id, exemplar) in enumerate(zip(train_doc_ids, train_exemplars)):
+        question = exemplar.get("question")
+        if question:
+            embedding_by_key[f"{doc_id}::{question}"] = train_arr[i]
+
+    _STEP4_CACHE.update({
+        "train_norms": train_arr / norms,
+        "train_exemplars": train_exemplars,
+        "train_doc_ids": train_doc_ids,
+        "embedding_by_key": embedding_by_key,
+    })
 
 
 def _lazy_init():
@@ -52,6 +97,7 @@ def _lazy_init():
         # Initialize FSP exemplar state once.
         try:
             phaseb_inference._load_fsp_state()
+            _prepare_step4_cache(phaseb_inference)
         except Exception as e:
             print(f"[finqa_exec_acc] _load_fsp_state warning: {e}")
         _BEDROCK_CLIENT = get_bedrock_client(region=os.getenv("AWS_REGION", "us-east-1"))
@@ -164,14 +210,19 @@ def _run_step4_generator(
     )
     import inference as phaseb_inference  # noqa: E402
 
-    query_emb = get_embedding(question, "amazon.titan-embed-text-v2:0", _BEDROCK_CLIENT)
+    query_emb = _cached_train_query_embedding(question, exclude_doc_id)
+    if query_emb is None:
+        query_emb = get_embedding(question, "amazon.titan-embed-text-v2:0", _BEDROCK_CLIENT)
     if not query_emb:
         return None
-    exemplars = phaseb_inference.select_exemplars_by_similarity(
-        query_embedding=query_emb,
-        shot_number=int(os.getenv("FINQA_REWARD_SHOTS", "5")),
-        exclude_doc_id=exclude_doc_id,
-    )
+    shot_number = int(os.getenv("FINQA_REWARD_SHOTS", "5"))
+    exemplars = _select_exemplars_cached(query_emb, shot_number, exclude_doc_id)
+    if exemplars is None:
+        exemplars = phaseb_inference.select_exemplars_by_similarity(
+            query_embedding=query_emb,
+            shot_number=shot_number,
+            exclude_doc_id=exclude_doc_id,
+        )
     system_prompt, user_prompt = phaseb_inference.build_fewshot_program_prompt(
         question, chunks, exemplars
     )
@@ -193,6 +244,39 @@ def _run_step4_generator(
     else:
         predicted = extract_number(generated)
     return predicted
+
+
+def _cached_train_query_embedding(question: str, doc_id: Optional[str]) -> Optional[List[float]]:
+    if not doc_id:
+        return None
+    embedding_by_key = _STEP4_CACHE.get("embedding_by_key") or {}
+    emb = embedding_by_key.get(f"{doc_id}::{question}")
+    if emb is None:
+        return None
+    return emb.tolist() if hasattr(emb, "tolist") else list(emb)
+
+
+def _select_exemplars_cached(
+    query_embedding: List[float],
+    shot_number: int,
+    exclude_doc_id: Optional[str],
+) -> Optional[List[Dict[str, Any]]]:
+    train_norms = _STEP4_CACHE.get("train_norms")
+    train_exemplars = _STEP4_CACHE.get("train_exemplars")
+    train_doc_ids = _STEP4_CACHE.get("train_doc_ids")
+    if train_norms is None or train_exemplars is None or train_doc_ids is None:
+        return None
+
+    query_vec = np.asarray(query_embedding)
+    query_norm = query_vec / (np.linalg.norm(query_vec) + 1e-10)
+    similarities = np.dot(train_norms, query_norm)
+    if exclude_doc_id:
+        similarities = similarities.copy()
+        for i, doc_id in enumerate(train_doc_ids):
+            if doc_id == exclude_doc_id:
+                similarities[i] = -1.0
+    top_indices = np.argsort(similarities)[-shot_number:][::-1]
+    return [train_exemplars[i] for i in top_indices[::-1]]
 
 
 # ── Public API ─────────────────────────────────────────────────

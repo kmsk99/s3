@@ -32,7 +32,7 @@ import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -400,20 +400,37 @@ def main():
         _write_naive_cache(naive_cache_path, expected_meta, args, cache, "in_progress")
         to_run = [it for it in precompute_items if question_key(it) not in cache]
         print(f"  {len(cache)} cached, {len(to_run)} to run")
+        max_pending = max(1, args.workers * 2)
+        done_count = 0
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
-            futures = {
-                ex.submit(naive_rag_correct, it, args.topk,
-                          args.retrieval_url, args.generator_url,
-                          args.naive_eval_mode): it
-                for it in to_run
-            }
-            for i, fut in enumerate(as_completed(futures), 1):
-                it = futures[fut]
-                cache[question_key(it)] = bool(fut.result())
-                if i % 50 == 0:
-                    _write_naive_cache(naive_cache_path, expected_meta, args, cache, "in_progress")
-                    print(f"  {i}/{len(to_run)} naive precompute done, "
-                          f"correct so far: {sum(cache.values())}")
+            pending: Dict[Any, Dict[str, Any]] = {}
+            iterator = iter(to_run)
+
+            def fill_pending() -> None:
+                while len(pending) < max_pending:
+                    try:
+                        item = next(iterator)
+                    except StopIteration:
+                        break
+                    fut = ex.submit(
+                        naive_rag_correct, item, args.topk,
+                        args.retrieval_url, args.generator_url,
+                        args.naive_eval_mode,
+                    )
+                    pending[fut] = item
+
+            fill_pending()
+            while pending:
+                done, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    it = pending.pop(fut)
+                    cache[question_key(it)] = bool(fut.result())
+                    done_count += 1
+                    if done_count % 50 == 0:
+                        _write_naive_cache(naive_cache_path, expected_meta, args, cache, "in_progress")
+                        print(f"  {done_count}/{len(to_run)} naive precompute done, "
+                              f"correct so far: {sum(cache.values())}")
+                fill_pending()
         _write_naive_cache(naive_cache_path, expected_meta, args, cache, "complete")
     print(f"naive_correct: {sum(cache.values())}/{len(cache)} = "
           f"{sum(cache.values())/max(len(cache),1)*100:.1f}%")
