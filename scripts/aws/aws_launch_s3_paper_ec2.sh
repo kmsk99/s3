@@ -125,13 +125,21 @@ sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && /home/ubuntu/.local/bin/uv venv --
 sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python --index-url https://download.pytorch.org/whl/cu121 torch==2.4.0"
 # Build dependencies must be installed BEFORE --no-build-isolation packages (e.g., flash-attn)
 sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python setuptools wheel packaging ninja"
-sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python 'vllm==0.6.3' 'transformers<4.48' accelerate 'tensordict<0.6' hydra-core ray wandb codetiming datasets dill pybind11 IPython matplotlib pandas numpy pyarrow"
+sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python 'vllm==0.6.3' 'transformers<4.48' accelerate 'tensordict<0.6' hydra-core ray wandb codetiming datasets dill pybind11 IPython matplotlib pandas numpy pyarrow boto3 pyserini weaviate-client"
 # flash-attn is OPTIONAL — vLLM uses VLLM_ATTENTION_BACKEND=XFORMERS, HF actor/critic use sdpa.
 # If build fails (common on DLAMI without matching cuDNN), skip and let HF fall back.
 export CUDA_HOME=/usr/local/cuda
 sudo -u ubuntu bash -c "CUDA_HOME=/usr/local/cuda /home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python --no-build-isolation flash-attn" || echo "[bootstrap] flash-attn skipped (using sdpa/xformers fallback)"
 # Install s3 paper as editable package (gives access to verl + s3 modules)
 sudo -u ubuntu bash -c "/home/ubuntu/.local/bin/uv pip install --python /home/ubuntu/s3/.venv-verl/bin/python -e /home/ubuntu/s3"
+sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/s3/train_logs"
+sudo -u ubuntu bash -c "/home/ubuntu/s3/.venv-verl/bin/python - <<'PY'
+import boto3
+import weaviate
+import pyserini
+from verl.utils.reward_score import finqa_exec_acc
+print('[bootstrap] verl reward dependencies import OK')
+PY"
 echo "[bootstrap] verl venv ready: \$(date)"
 
 # 5. Weaviate via docker compose v2 (pitfall #6)
