@@ -31,12 +31,24 @@ REPO_ROOT = Path(os.getenv(
 ))
 sys.path.insert(0, str(REPO_ROOT / "src" / "finqa_common" / "src"))
 
-from finqa_common.utils import generate_answer, get_bedrock_client  # noqa: E402
+import requests  # noqa: E402
+
+try:
+    from finqa_common.utils import generate_answer, get_bedrock_client
+except Exception:
+    generate_answer = None
+    get_bedrock_client = None
 
 
 GENERATOR_MODEL = os.getenv("FINQA_GENERATOR_MODEL", "moonshotai.kimi-k2.5")
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
 DEFAULT_MAX_TOKENS = int(os.getenv("FINQA_GEN_MAX_TOKENS", "2048"))
+
+# OpenRouter — when set, routes generation through OpenRouter chat completions
+# instead of Bedrock. Bedrock is the fallback path.
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_MODEL = os.getenv("OPENROUTER_GENERATOR_MODEL", "moonshotai/kimi-k2-0905")
+USE_OPENROUTER = bool(OPENROUTER_API_KEY)
 
 
 class ChatMessage(BaseModel):
@@ -61,8 +73,26 @@ _bedrock_client = None
 
 def _ensure_client():
     global _bedrock_client
-    if _bedrock_client is None:
+    if not USE_OPENROUTER and _bedrock_client is None and get_bedrock_client is not None:
         _bedrock_client = get_bedrock_client(region=AWS_REGION)
+
+
+def _openrouter_chat(messages, max_tokens, temperature):
+    payload = {
+        "model": OPENROUTER_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+    }
+    r = requests.post(
+        "https://openrouter.ai/api/v1/chat/completions",
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                 "Content-Type": "application/json"},
+        json=payload,
+        timeout=180,
+    )
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"]
 
 
 def _flatten_messages(messages: List[ChatMessage]) -> tuple[str, str]:
@@ -90,16 +120,20 @@ def chat_completions(request: ChatCompletionRequest):
     if not request.messages:
         raise HTTPException(status_code=400, detail="empty messages")
     _ensure_client()
-    user_prompt, system_prompt = _flatten_messages(request.messages)
-    text = generate_answer(
-        user_prompt,
-        GENERATOR_MODEL,
-        _bedrock_client,
-        request.max_tokens or DEFAULT_MAX_TOKENS,
-        request.temperature,
-        system_prompt=system_prompt or None,
-    )
-    text = text or ""
+    if USE_OPENROUTER:
+        msgs = [{"role": m.role, "content": m.content} for m in request.messages]
+        text = _openrouter_chat(msgs, request.max_tokens or DEFAULT_MAX_TOKENS,
+                                request.temperature) or ""
+    else:
+        user_prompt, system_prompt = _flatten_messages(request.messages)
+        text = generate_answer(
+            user_prompt,
+            GENERATOR_MODEL,
+            _bedrock_client,
+            request.max_tokens or DEFAULT_MAX_TOKENS,
+            request.temperature,
+            system_prompt=system_prompt or None,
+        ) or ""
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:24]}",
         "object": "chat.completion",

@@ -8,7 +8,8 @@ s3 paper §3.5 / Appendix uses parquet inputs to verl with the following columns
 - extra_info       : dict carrying question, golden_answers, doc_id, gold_inds
 
 Naive RAG cache (matches s3 paper line 423):
-- Run naive top-k retrieval + frozen generator on every train question.
+- Run naive top-k retrieval + the same frozen Step 4 few-shot PoT generator
+  used by the PPO reward on every train question.
 - Save cache mapping question_key → bool (naive_correct).
 - Filter to hard-only (naive_correct=False) before writing parquet.
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -35,6 +37,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+S3_ROOT = Path(__file__).resolve().parents[1]
+if str(S3_ROOT) not in sys.path:
+    sys.path.insert(0, str(S3_ROOT))
 
 try:
     import pyarrow as pa
@@ -62,6 +68,9 @@ S3_SYSTEM_PROMPT = (
     "  <important_info>[doc_index, ...]</important_info>\n"
     "  <search_complete>True|False</search_complete>\n"
 )
+
+NAIVE_CACHE_EVALUATOR = "step4_fewshot_pot_v1"
+_FINQA_EXEC_ACC_MODULE = None
 
 
 def question_key(item: Dict[str, Any]) -> str:
@@ -127,13 +136,82 @@ def numeric_match(prediction: str, gold: Any) -> bool:
         return False
 
 
+def _fake_solution_for_naive_step4(
+    question: str,
+    doc_id: str,
+    docs: List[Dict[str, Any]],
+) -> str:
+    """Build a minimal s3 trajectory so reward_score.finqa_exec_acc evaluates
+    one-shot D_RAG with the exact same Step 4 generator path as D_s3.
+
+    Retrieval stays naive: one query q_0=Q and the initial top-k docs. The
+    <important_info> tag selects all retrieved docs as D_RAG.
+    """
+    context = passages_to_string(docs)
+    selected = ", ".join(str(i) for i in range(1, len(docs) + 1))
+    return (
+        f'<question>{question}</question>\n'
+        f'doc_id: "{doc_id}"\n'
+        f"<information>{context}</information>\n"
+        f"<important_info>[{selected}]</important_info>\n"
+        "<search_complete>True</search_complete>\n"
+    )
+
+
+def _step4_fewshot_correct(
+    question: str,
+    doc_id: str,
+    docs: List[Dict[str, Any]],
+    gold: Any,
+) -> bool:
+    """Acc(Step4-G(Q, D_RAG), A) for the naive baseline term.
+
+    This intentionally imports the VERL reward hook so the naive baseline and
+    PPO reward share the same frozen generator/evaluator:
+      Acc(G(Q, D_s3), A) - Acc(G(Q, D_RAG), A)
+    """
+    compute_score_finqa_rag = _load_finqa_exec_acc_module().compute_score_finqa_rag
+
+    solution = _fake_solution_for_naive_step4(question, doc_id, docs)
+    score, _, _ = compute_score_finqa_rag(solution, str(gold), data_source="finqa_exec_acc")
+    return bool(score >= 1.0)
+
+
+def _load_finqa_exec_acc_module():
+    """Load the FinQA reward file directly without importing the full verl package.
+
+    The reward function itself is the contract we need for Step 4 alignment.
+    Importing ``verl.utils...`` also imports training/runtime protocol modules,
+    which can require environment-specific dependencies (for example
+    tensordict) that are irrelevant to offline dataset preparation.
+    """
+    global _FINQA_EXEC_ACC_MODULE
+    if _FINQA_EXEC_ACC_MODULE is not None:
+        return _FINQA_EXEC_ACC_MODULE
+
+    reward_path = S3_ROOT / "verl" / "utils" / "reward_score" / "finqa_exec_acc.py"
+    spec = importlib.util.spec_from_file_location("_finqa_exec_acc_direct", reward_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load FinQA reward module from {reward_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    _FINQA_EXEC_ACC_MODULE = module
+    return module
+
+
 def naive_rag_correct(item: Dict[str, Any], topk: int,
-                       retrieval_url: str, generator_url: str) -> bool:
+                       retrieval_url: str, generator_url: str,
+                       naive_eval_mode: str) -> bool:
     question = item["qa"]["question"]
     doc_id = item["id"]
     gold = item["qa"].get("exe_ans", item["qa"].get("answer"))
     try:
         docs = retrieve_initial(question, doc_id, topk, retrieval_url)
+        if naive_eval_mode == "step4":
+            return _step4_fewshot_correct(question, doc_id, docs, gold)
+
+        # Legacy smoke mode: direct numeric answer from the generator adapter.
+        # Kept only for comparison/debugging; full retraining should use step4.
         context = passages_to_string(docs)
         prompt = (
             f"Use the following contexts (some might be irrelevant) on demand:\n\n"
@@ -148,6 +226,81 @@ def naive_rag_correct(item: Dict[str, Any], topk: int,
     except Exception as e:
         print(f"  naive_rag err {doc_id}: {e}")
         return False
+
+
+def _cache_meta_path(cache_path: Path) -> Path:
+    return cache_path.with_suffix(cache_path.suffix + ".meta.json")
+
+
+def _cache_meta(args: argparse.Namespace) -> Dict[str, Any]:
+    return {
+        "evaluator": NAIVE_CACHE_EVALUATOR if args.naive_eval_mode == "step4" else "legacy_simple_numeric_v1",
+        "naive_eval_mode": args.naive_eval_mode,
+        "retrieval": {
+            "topk": args.topk,
+            "contract": "one-shot q0=question, doc_id-scoped retrieval",
+        },
+        "generator": {
+            "reward_generator": os.getenv("FINQA_REWARD_GENERATOR", "moonshotai.kimi-k2.5"),
+            "reward_shots": int(os.getenv("FINQA_REWARD_SHOTS", "5")),
+            "reward_temp": float(os.getenv("FINQA_REWARD_TEMP", "0.0")),
+            "pipeline": "Step 4 few-shot PoT + execute_program + answer_normalizer"
+            if args.naive_eval_mode == "step4"
+            else "direct final-number-only prompt + numeric_match",
+        },
+    }
+
+
+def _cache_compatible(existing: Dict[str, Any], expected: Dict[str, Any]) -> bool:
+    keys = [
+        ("evaluator",),
+        ("naive_eval_mode",),
+        ("retrieval", "topk"),
+        ("generator", "reward_generator"),
+        ("generator", "reward_shots"),
+        ("generator", "reward_temp"),
+    ]
+    for path in keys:
+        lhs: Any = existing
+        rhs: Any = expected
+        for key in path:
+            if not isinstance(lhs, dict) or not isinstance(rhs, dict):
+                return False
+            lhs = lhs.get(key)
+            rhs = rhs.get(key)
+        if lhs != rhs:
+            return False
+    return True
+
+
+def _write_naive_cache(
+    cache_path: Path,
+    expected_meta: Dict[str, Any],
+    args: argparse.Namespace,
+    cache: Dict[str, bool],
+    status: str,
+) -> None:
+    """Persist naive correctness cache and compatible metadata.
+
+    Metadata is written even for in-progress caches so a long Step 4 precompute
+    can resume safely after interruption instead of falling back to a stale
+    no-metadata cache.
+    """
+    with open(cache_path, "w") as f:
+        json.dump(cache, f)
+
+    meta = dict(expected_meta)
+    meta.update({
+        "status": status,
+        "updated_at_unix": int(time.time()),
+        "cache_entries": len(cache),
+        "cache_correct": sum(cache.values()),
+        "finqa_dir": str(args.finqa_dir),
+    })
+    if status == "complete":
+        meta["completed_at_unix"] = meta["updated_at_unix"]
+    with open(_cache_meta_path(cache_path), "w") as f:
+        json.dump(meta, f, indent=2)
 
 
 def build_prompt(item: Dict[str, Any], initial_docs: List[Dict[str, Any]]) -> List[Dict[str, str]]:
@@ -180,6 +333,8 @@ def main():
     parser.add_argument("--generator-url", type=str, default="http://127.0.0.1:8000/v1/chat/completions")
     parser.add_argument("--topk", type=int, default=8, help="Initial naive RAG top-k (s3 paper default 3, scaled for FinQA tables)")
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument("--naive-eval-mode", choices=["step4", "simple"], default="step4",
+                        help="How to compute naive_correct. step4 matches PPO reward's frozen Step 4 few-shot PoT generator; simple is legacy smoke mode.")
     parser.add_argument("--hard-only", action="store_true", default=True,
                         help="Restrict to questions where naive RAG fails (s3 paper line 423)")
     parser.add_argument("--skip-precompute", action="store_true",
@@ -194,6 +349,7 @@ def main():
         raise SystemExit("pyarrow required: pip install pyarrow")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("FINQA_REPO_ROOT", str(args.finqa_dir.resolve().parent))
 
     splits = {
         "train": args.finqa_dir / "train.json",
@@ -205,33 +361,60 @@ def main():
             print(f"  warning: {p} not found, skipping {name}")
 
     naive_cache_path = args.out_dir / "naive_correct.json"
+    naive_meta_path = _cache_meta_path(naive_cache_path)
+    expected_meta = _cache_meta(args)
     cache: Dict[str, bool] = {}
     if naive_cache_path.exists():
-        with open(naive_cache_path) as f:
-            cache = json.load(f)
+        existing_meta: Optional[Dict[str, Any]] = None
+        if naive_meta_path.exists():
+            with open(naive_meta_path) as f:
+                existing_meta = json.load(f)
+        if existing_meta and _cache_compatible(existing_meta, expected_meta):
+            with open(naive_cache_path) as f:
+                cache = json.load(f)
+            print(
+                f"Loaded compatible naive_correct cache: {len(cache)} entries "
+                f"({expected_meta['evaluator']})"
+            )
+        else:
+            reason = "missing metadata" if existing_meta is None else "metadata mismatch"
+            msg = (
+                f"Ignoring stale naive_correct cache ({reason}); "
+                f"expected evaluator={expected_meta['evaluator']}, topk={args.topk}."
+            )
+            if args.skip_precompute:
+                raise SystemExit(f"{msg} Cannot --skip-precompute with stale cache.")
+            print(msg)
 
     train_items = load_finqa(splits["train"])
+    precompute_items = train_items[: args.limit] if args.limit else train_items
 
     if not args.skip_precompute:
-        print(f"Precomputing naive RAG correctness on {len(train_items)} train items...")
-        to_run = [it for it in train_items if question_key(it) not in cache]
+        print(
+            f"Precomputing naive RAG correctness on {len(precompute_items)} train items "
+            f"with evaluator={expected_meta['evaluator']}..."
+        )
+        # Persist an in-progress metadata file immediately. This lets interrupted
+        # long runs resume from the partial cache while still rejecting legacy or
+        # mismatched caches.
+        _write_naive_cache(naive_cache_path, expected_meta, args, cache, "in_progress")
+        to_run = [it for it in precompute_items if question_key(it) not in cache]
         print(f"  {len(cache)} cached, {len(to_run)} to run")
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             futures = {
                 ex.submit(naive_rag_correct, it, args.topk,
-                          args.retrieval_url, args.generator_url): it
+                          args.retrieval_url, args.generator_url,
+                          args.naive_eval_mode): it
                 for it in to_run
             }
             for i, fut in enumerate(as_completed(futures), 1):
                 it = futures[fut]
                 cache[question_key(it)] = bool(fut.result())
                 if i % 50 == 0:
-                    with open(naive_cache_path, "w") as f:
-                        json.dump(cache, f)
+                    _write_naive_cache(naive_cache_path, expected_meta, args, cache, "in_progress")
                     print(f"  {i}/{len(to_run)} naive precompute done, "
                           f"correct so far: {sum(cache.values())}")
-        with open(naive_cache_path, "w") as f:
-            json.dump(cache, f)
+        _write_naive_cache(naive_cache_path, expected_meta, args, cache, "complete")
     print(f"naive_correct: {sum(cache.values())}/{len(cache)} = "
           f"{sum(cache.values())/max(len(cache),1)*100:.1f}%")
 

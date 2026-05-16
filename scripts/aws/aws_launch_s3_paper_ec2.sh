@@ -31,6 +31,8 @@ export AWS_DEFAULT_REGION="${AWS_REGION:-us-east-1}"
 PROFILE="phase-c"
 MODE="${1:-smoke}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-p4d.24xlarge}"
+FINQA_S3_PREFIX="${FINQA_S3_PREFIX:-finqa_s3}"
+CODE_TARBALL_KEY="${CODE_TARBALL_KEY:-s3-paper-code-launch-$(date -u +%Y%m%dT%H%M%SZ).tar.gz}"
 
 case "$MODE" in
     smoke) TOTAL_STEPS=1 ; INSTANCE_LIFETIME="1 hour" ;;
@@ -48,6 +50,8 @@ if [ -z "$PURCHASE" ]; then
 fi
 echo "Mode: $MODE ($INSTANCE_LIFETIME budget) Purchase: $PURCHASE Instance: $INSTANCE_TYPE"
 echo "TOTAL_STEPS: $TOTAL_STEPS (s3 paper §3.5 uses 20 steps for full run)"
+echo "FINQA_S3_PREFIX: s3://$S3_BUCKET/$FINQA_S3_PREFIX/"
+echo "CODE_TARBALL_KEY: s3://$S3_BUCKET/$CODE_TARBALL_KEY"
 
 AMI_ID=$(aws ec2 describe-images \
     --owners amazon \
@@ -62,6 +66,22 @@ if [ -z "$AMI_ID" ] || [ "$AMI_ID" = "None" ]; then
 fi
 echo "AMI: $AMI_ID"
 
+CODE_TARBALL=$(mktemp)
+echo "Packaging current s3/ code for EC2 bootstrap..."
+tar \
+    --exclude='.git' \
+    --exclude='.omc' \
+    --exclude='.omx' \
+    --exclude='__pycache__' \
+    --exclude='data' \
+    --exclude='train_logs' \
+    --exclude='verl_checkpoints' \
+    -czf "$CODE_TARBALL" \
+    -C "$WIKI_ROOT/s3" .
+aws s3 cp "$CODE_TARBALL" "s3://$S3_BUCKET/$CODE_TARBALL_KEY" \
+    --profile "$PROFILE" --region us-east-1
+echo "Uploaded code tarball."
+
 BOOTSTRAP=$(mktemp)
 cat > "$BOOTSTRAP" <<EOF
 #!/bin/bash
@@ -74,7 +94,7 @@ cd /home/ubuntu
 # 1. Code tarballs from S3 (pitfall #12 — private repo workaround)
 sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/fin-qa-research /home/ubuntu/s3"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/fin-qa-code.tar.gz /home/ubuntu/fin-qa-code.tar.gz"
-sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/s3-paper-code.tar.gz /home/ubuntu/s3-paper-code.tar.gz"
+sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/$CODE_TARBALL_KEY /home/ubuntu/s3-paper-code.tar.gz"
 sudo -u ubuntu bash -c "cd /home/ubuntu/fin-qa-research && tar -xzf /home/ubuntu/fin-qa-code.tar.gz"
 sudo -u ubuntu bash -c "cd /home/ubuntu/s3 && tar -xzf /home/ubuntu/s3-paper-code.tar.gz"
 sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/fin-qa-research/dataset"
@@ -119,11 +139,19 @@ curl -fsS http://127.0.0.1:8080/v1/schema | python3 -c "import sys,json; cs=json
 echo "[bootstrap] weaviate restored: \$(date)"
 
 # 7. Pull pre-generated parquet + naive_correct cache + FinQA dataset from S3
-sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/s3/data/finqa_s3 && aws s3 sync s3://$S3_BUCKET/finqa_s3/ /home/ubuntu/s3/data/finqa_s3/"
+sudo -u ubuntu bash -c "mkdir -p /home/ubuntu/s3/data/finqa_s3 && aws s3 sync s3://$S3_BUCKET/$FINQA_S3_PREFIX/ /home/ubuntu/s3/data/finqa_s3/"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/dataset/train.json /home/ubuntu/fin-qa-research/dataset/train.json"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/dataset/dev.json /home/ubuntu/fin-qa-research/dataset/dev.json"
 sudo -u ubuntu bash -c "aws s3 cp s3://$S3_BUCKET/dataset/test.json /home/ubuntu/fin-qa-research/dataset/test.json"
 echo "[bootstrap] data ready: \$(date)"
+
+# 7b. Preflight parquet row counts. This prevents accidentally reusing a
+# smoke/limited parquet set (e.g. train=171 rows) for a full PPO run.
+MIN_TRAIN_ROWS=${MIN_TRAIN_ROWS:-1000}
+MIN_VALID_ROWS=${MIN_VALID_ROWS:-800}
+MIN_TEST_ROWS=${MIN_TEST_ROWS:-1000}
+sudo -u ubuntu bash -c "/home/ubuntu/s3/.venv-verl/bin/python /home/ubuntu/s3/integrations/inspect_finqa_s3_parquet.py /home/ubuntu/s3/data/finqa_s3 --expected-train-min $MIN_TRAIN_ROWS --expected-valid-min $MIN_VALID_ROWS --expected-test-min $MIN_TEST_ROWS --expected-naive-cache 6251"
+echo "[bootstrap] finqa_s3 parquet preflight passed: \$(date)"
 
 # 8. Spot interrupt handler (pitfall #10 — HTTP 200 only)
 cat > /home/ubuntu/spot-watch.sh <<'WATCH'
@@ -211,9 +239,12 @@ echo "  Bootstrap: tail -f /var/log/s3-paper-bootstrap.log"
 echo "  Training:  tail -f /home/ubuntu/s3-train.log"
 echo
 echo "  Mode: $MODE  Time budget: $INSTANCE_LIFETIME  Steps: $TOTAL_STEPS"
+echo "  FinQA data: s3://$S3_BUCKET/$FINQA_S3_PREFIX/"
+echo "  Code:      s3://$S3_BUCKET/$CODE_TARBALL_KEY"
 echo
 echo "INSTANCE_ID=$INSTANCE_ID" >> "$RUNTIME_FILE"
 echo "INSTANCE_IP=$PUBLIC_IP" >> "$RUNTIME_FILE"
 echo "MODE=$MODE" >> "$RUNTIME_FILE"
 echo
 echo "To terminate: aws ec2 terminate-instances --instance-ids $INSTANCE_ID --profile $PROFILE"
+rm -f "$CODE_TARBALL"

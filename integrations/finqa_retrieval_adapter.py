@@ -34,11 +34,19 @@ REPO_ROOT = Path(os.getenv(
 sys.path.insert(0, str(REPO_ROOT / "src" / "finqa_common" / "src"))
 
 import weaviate  # noqa: E402
-from finqa_common.utils import (  # noqa: E402
-    get_bedrock_client,
-    get_embedding,
-    rerank_with_cohere,
-)
+import requests  # noqa: E402
+
+# Bedrock support kept as fallback when OpenRouter not configured.
+try:
+    from finqa_common.utils import (
+        get_bedrock_client,
+        get_embedding,
+        rerank_with_cohere,
+    )
+except Exception:
+    get_bedrock_client = None
+    get_embedding = None
+    rerank_with_cohere = None
 
 
 COLLECTION_NAME = os.getenv("FINQA_COLLECTION", "FinQA_Chunking_Markdown")
@@ -51,6 +59,12 @@ _HP = WEAVIATE_URL.replace("http://", "").replace("https://", "")
 WEAVIATE_HOST = _HP.split(":")[0]
 WEAVIATE_PORT = int(_HP.split(":")[1]) if ":" in _HP else 8080
 AWS_REGION = os.getenv("AWS_REGION", "us-east-1")
+
+# OpenRouter — when key is set, route rerank through OpenRouter and skip
+# Bedrock-based embedding (use BM25-only Weaviate retrieval).
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_RERANK_MODEL = os.getenv("OPENROUTER_RERANK_MODEL", "cohere/rerank-v3.5")
+USE_OPENROUTER = bool(OPENROUTER_API_KEY)
 
 
 class QueryRequest(BaseModel):
@@ -71,8 +85,35 @@ def _ensure_clients():
     global _weaviate_client, _bedrock_client
     if _weaviate_client is None:
         _weaviate_client = weaviate.connect_to_local(host=WEAVIATE_HOST, port=WEAVIATE_PORT)
-    if _bedrock_client is None:
+    if _bedrock_client is None and not USE_OPENROUTER and get_bedrock_client is not None:
         _bedrock_client = get_bedrock_client(region=AWS_REGION)
+
+
+def _openrouter_rerank(query: str, documents: list, top_n: int) -> list:
+    """Call OpenRouter Cohere rerank. Returns documents reordered with rerank_score."""
+    payload = {
+        "model": OPENROUTER_RERANK_MODEL,
+        "query": query,
+        "documents": [d.get("text", "") for d in documents],
+        "top_n": min(top_n, len(documents)),
+    }
+    r = requests.post(
+        "https://openrouter.ai/api/v1/rerank",
+        headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                 "Content-Type": "application/json"},
+        json=payload,
+        timeout=60,
+    )
+    r.raise_for_status()
+    body = r.json()
+    out = []
+    for entry in body.get("results", []):
+        idx = entry["index"]
+        if 0 <= idx < len(documents):
+            doc = dict(documents[idx])
+            doc["rerank_score"] = entry.get("relevance_score")
+            out.append(doc)
+    return out
 
 
 def _format_doc(chunk: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,21 +136,35 @@ def _format_doc(chunk: Dict[str, Any]) -> Dict[str, Any]:
 def _retrieve_single(
     query: str, topk: int, doc_id: Optional[str]
 ) -> List[Dict[str, Any]]:
-    embedding = get_embedding(query, EMBEDDING_MODEL, _bedrock_client)
-    if not embedding:
-        return []
     coll = _weaviate_client.collections.get(COLLECTION_NAME)
-    if doc_id:
-        flt = weaviate.classes.query.Filter.by_property("doc_id").equal(doc_id)
-        res = coll.query.hybrid(
-            query=query, vector=embedding, query_properties=["text"],
-            alpha=HYBRID_ALPHA, limit=TOP_K_INITIAL, return_metadata=["score"], filters=flt,
-        )
+    if USE_OPENROUTER:
+        # BM25-only retrieval (no Bedrock embedding); rerank via OpenRouter
+        if doc_id:
+            flt = weaviate.classes.query.Filter.by_property("doc_id").equal(doc_id)
+            res = coll.query.bm25(
+                query=query, query_properties=["text"],
+                limit=TOP_K_INITIAL, return_metadata=["score"], filters=flt,
+            )
+        else:
+            res = coll.query.bm25(
+                query=query, query_properties=["text"],
+                limit=TOP_K_INITIAL, return_metadata=["score"],
+            )
     else:
-        res = coll.query.hybrid(
-            query=query, vector=embedding, query_properties=["text"],
-            alpha=HYBRID_ALPHA, limit=TOP_K_INITIAL, return_metadata=["score"],
-        )
+        embedding = get_embedding(query, EMBEDDING_MODEL, _bedrock_client)
+        if not embedding:
+            return []
+        if doc_id:
+            flt = weaviate.classes.query.Filter.by_property("doc_id").equal(doc_id)
+            res = coll.query.hybrid(
+                query=query, vector=embedding, query_properties=["text"],
+                alpha=HYBRID_ALPHA, limit=TOP_K_INITIAL, return_metadata=["score"], filters=flt,
+            )
+        else:
+            res = coll.query.hybrid(
+                query=query, vector=embedding, query_properties=["text"],
+                alpha=HYBRID_ALPHA, limit=TOP_K_INITIAL, return_metadata=["score"],
+            )
     chunks = [
         {
             "id": f"{o.properties.get('doc_id','')}_{o.properties.get('chunk_index','')}",
@@ -123,11 +178,14 @@ def _retrieve_single(
     ]
     if not chunks:
         return []
-    reranked = rerank_with_cohere(
-        query=query, documents=chunks, model_id=RERANK_MODEL,
-        bedrock_client=_bedrock_client, top_n=topk,
-        weaviate_client=_weaviate_client,
-    )
+    if USE_OPENROUTER:
+        reranked = _openrouter_rerank(query, chunks, topk)
+    else:
+        reranked = rerank_with_cohere(
+            query=query, documents=chunks, model_id=RERANK_MODEL,
+            bedrock_client=_bedrock_client, top_n=topk,
+            weaviate_client=_weaviate_client,
+        )
     return [_format_doc(c) for c in reranked[:topk]]
 
 
