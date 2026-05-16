@@ -236,9 +236,13 @@ def score_with_step4(
     """
     global _PHASEB_LOADED
     import sys
-    sys.path.insert(0, "/Users/mason/project/personal/fin-qa-research-wiki/raw/fin-qa-research/src/finqa_common/src")
-    sys.path.insert(0, "/Users/mason/project/personal/fin-qa-research-wiki/raw/fin-qa-research/src/nr-pb-step-4-s3-integrated-policy/code")
-    sys.path.insert(0, "/Users/mason/project/personal/fin-qa-research-wiki/raw/fin-qa-research/src/nr-pb-step-4-s3-integrated-policy/train")
+    repo_root = Path(os.getenv(
+        "FINQA_REPO_ROOT",
+        "/Users/mason/project/personal/fin-qa-research-wiki/raw/fin-qa-research",
+    ))
+    sys.path.insert(0, str(repo_root / "src" / "finqa_common" / "src"))
+    sys.path.insert(0, str(repo_root / "src" / "nr-pb-step-4-s3-integrated-policy" / "code"))
+    sys.path.insert(0, str(repo_root / "src" / "nr-pb-step-4-s3-integrated-policy" / "train"))
     from finqa_common.utils import (
         execute_program, extract_number, extract_python_code,
     )
