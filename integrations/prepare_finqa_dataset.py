@@ -310,9 +310,11 @@ def build_prompt(item: Dict[str, Any], initial_docs: List[Dict[str, Any]]) -> Li
     (rl_dataset.py expects this exact shape).
     """
     question = item["qa"]["question"]
+    doc_id = item["id"]
     context = passages_to_string(initial_docs)
     user_content = (
         f"<question>{question}</question>\n\n"
+        f'doc_id: "{doc_id}"\n\n'
         f"Initial retrieval (naive RAG top-{len(initial_docs)}):\n"
         f"<information>{context}</information>\n\n"
         "Decide whether the searched results are enough. Emit the strict "

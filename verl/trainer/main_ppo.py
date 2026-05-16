@@ -118,14 +118,17 @@ class RewardManager():
 
             # Get scores and zeroshot info
             if not self.val_only:
-                score, answer_zeroshot, answer_zeroshot_score = compute_score_fn(
-                    solution_str=sequences_str, 
-                    ground_truth=ground_truth, 
+                score_kwargs = dict(
+                    solution_str=sequences_str,
+                    ground_truth=ground_truth,
                     zeroshot_answers=self.zeroshot_answers,
                     data_source=data_source,
                     use_utility_score=USE_UTILITY_SCORE,
-                    use_generation_score=USE_GENERATION_SCORE
+                    use_generation_score=USE_GENERATION_SCORE,
                 )
+                if data_source == "finqa_exec_acc":
+                    score_kwargs["extra_info"] = data_item.non_tensor_batch.get("extra_info", None)
+                score, answer_zeroshot, answer_zeroshot_score = compute_score_fn(**score_kwargs)
                 
             else:
                 print(f"start output sequence")

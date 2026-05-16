@@ -33,6 +33,7 @@ MODE="${1:-smoke}"
 INSTANCE_TYPE="${INSTANCE_TYPE:-p4d.24xlarge}"
 FINQA_S3_PREFIX="${FINQA_S3_PREFIX:-finqa_s3}"
 CODE_TARBALL_KEY="${CODE_TARBALL_KEY:-s3-paper-code-launch-$(date -u +%Y%m%dT%H%M%SZ).tar.gz}"
+SUBNET_ID="${SUBNET_ID:-}"
 
 case "$MODE" in
     smoke) TOTAL_STEPS=1 ; INSTANCE_LIFETIME="1 hour" ;;
@@ -52,6 +53,9 @@ echo "Mode: $MODE ($INSTANCE_LIFETIME budget) Purchase: $PURCHASE Instance: $INS
 echo "TOTAL_STEPS: $TOTAL_STEPS (s3 paper §3.5 uses 20 steps for full run)"
 echo "FINQA_S3_PREFIX: s3://$S3_BUCKET/$FINQA_S3_PREFIX/"
 echo "CODE_TARBALL_KEY: s3://$S3_BUCKET/$CODE_TARBALL_KEY"
+if [ -n "$SUBNET_ID" ]; then
+    echo "SUBNET_ID: $SUBNET_ID"
+fi
 
 AMI_ID=$(aws ec2 describe-images \
     --owners amazon \
@@ -81,6 +85,13 @@ tar \
 aws s3 cp "$CODE_TARBALL" "s3://$S3_BUCKET/$CODE_TARBALL_KEY" \
     --profile "$PROFILE" --region us-east-1
 echo "Uploaded code tarball."
+
+# Defaults are expanded into the bootstrap script below. Keep them defined in
+# the launcher shell as well, because this script runs with `set -u` and the
+# bootstrap heredoc intentionally expands local AWS/data variables.
+MIN_TRAIN_ROWS="${MIN_TRAIN_ROWS:-1000}"
+MIN_VALID_ROWS="${MIN_VALID_ROWS:-800}"
+MIN_TEST_ROWS="${MIN_TEST_ROWS:-1000}"
 
 BOOTSTRAP=$(mktemp)
 cat > "$BOOTSTRAP" <<EOF
@@ -203,11 +214,16 @@ MARKET_OPTS=()
 if [ "$PURCHASE" = "spot" ]; then
     MARKET_OPTS=(--instance-market-options 'MarketType=spot,SpotOptions={SpotInstanceType=one-time}')
 fi
+SUBNET_OPTS=()
+if [ -n "$SUBNET_ID" ]; then
+    SUBNET_OPTS=(--subnet-id "$SUBNET_ID")
+fi
 
 INSTANCE_ID=$(aws ec2 run-instances \
     --image-id "$AMI_ID" \
     --instance-type "$INSTANCE_TYPE" \
     ${MARKET_OPTS[@]+"${MARKET_OPTS[@]}"} \
+    ${SUBNET_OPTS[@]+"${SUBNET_OPTS[@]}"} \
     --key-name "$SSH_KEY_NAME" \
     --security-group-ids "$SG_ID" \
     --iam-instance-profile "Name=phase-c-ec2-role" \

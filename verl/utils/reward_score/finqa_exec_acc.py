@@ -11,11 +11,13 @@ Where:
   trajectory (parsed from solution_str)
 
 Naive baseline term Acc(G(Q, D_RAG)) is precomputed and lives in
-naive_correct.json. The smoke build uses the absolute accuracy Acc(G(Q, D_s3))
-as the reward; subtract naive_correct in the trainer if/when the baseline term
-is wired through.
+naive_correct.json. The returned reward is a clamped improvement indicator:
+max(Acc(G(Q, D_s3), A) - Acc(G(Q, D_RAG), A), 0). On the hard-only training
+split Acc(G(Q, D_RAG), A)=0, so this preserves the prior 0/1 reward scale while
+matching the s3 improvement-over-naive intent.
 """
 
+import hashlib
 import json
 import os
 import re
@@ -38,6 +40,7 @@ _STEP4_CACHE: Dict[str, Any] = {
     "train_doc_ids": None,
     "embedding_by_key": None,
 }
+_NAIVE_CACHE: Optional[Dict[str, bool]] = None
 
 
 def _prepare_step4_cache(phaseb_inference) -> None:
@@ -194,6 +197,85 @@ def _extract_doc_id(solution_str: str) -> Optional[str]:
     return m.group(1) if m else None
 
 
+def _question_hash(question: str) -> str:
+    return hashlib.sha256(question.encode("utf-8")).hexdigest()[:16]
+
+
+def _candidate_naive_cache_paths() -> List[Path]:
+    paths = []
+    env_path = os.getenv("FINQA_NAIVE_CORRECT_PATH", "").strip()
+    if env_path:
+        paths.append(Path(env_path))
+    repo_root = Path(os.getenv("FINQA_REPO_ROOT", "/home/ubuntu/fin-qa-research"))
+    cwd = Path.cwd()
+    paths.extend([
+        cwd / "data" / "finqa_s3" / "naive_correct.json",
+        cwd / "data" / "finqa_s3_full" / "naive_correct.json",
+        cwd / "s3" / "data" / "finqa_s3" / "naive_correct.json",
+        cwd / "s3" / "data" / "finqa_s3_full" / "naive_correct.json",
+        repo_root.parent / "s3" / "data" / "finqa_s3" / "naive_correct.json",
+        repo_root.parent / "s3" / "data" / "finqa_s3_full" / "naive_correct.json",
+    ])
+    out = []
+    seen = set()
+    for path in paths:
+        resolved = path.expanduser()
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            out.append(resolved)
+    return out
+
+
+def _load_naive_cache() -> Dict[str, bool]:
+    global _NAIVE_CACHE
+    if _NAIVE_CACHE is not None:
+        return _NAIVE_CACHE
+    for path in _candidate_naive_cache_paths():
+        if path.exists():
+            with open(path) as f:
+                raw = json.load(f)
+            _NAIVE_CACHE = {str(k): bool(v) for k, v in raw.items()}
+            print(f"[finqa_exec_acc] loaded naive_correct cache: {path} ({len(_NAIVE_CACHE)} entries)")
+            return _NAIVE_CACHE
+    _NAIVE_CACHE = {}
+    print("[finqa_exec_acc] naive_correct cache not found; using baseline=0")
+    return _NAIVE_CACHE
+
+
+def _naive_baseline_correct(
+    question: str,
+    doc_id: Optional[str],
+    extra_info: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Lookup Acc(G(Q, D_RAG), A) from naive_correct.json.
+
+    Prefer doc_id from parquet extra_info, then doc_id embedded in the prompt.
+    As a compatibility fallback for older parquet rows, match by question hash
+    when the hash is unique in the cache.
+    """
+    if extra_info:
+        doc_id = str(extra_info.get("doc_id") or doc_id or "")
+        question = str(extra_info.get("question") or question)
+    cache = _load_naive_cache()
+    if not cache:
+        return False
+
+    qh = _question_hash(question)
+    if doc_id:
+        key = f"{doc_id}::{qh}"
+        if key in cache:
+            return bool(cache[key])
+
+    suffix = f"::{qh}"
+    matches = [bool(v) for k, v in cache.items() if k.endswith(suffix)]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        print(f"[finqa_exec_acc] ambiguous naive baseline for question hash {qh}; using baseline=0")
+    return False
+
+
 # ── Step 4 G(Q, D_s3) ──────────────────────────────────────────
 def _run_step4_generator(
     question: str,
@@ -294,6 +376,7 @@ def compute_score_finqa_rag(
     data_source=None,
     use_utility_score=True,
     use_generation_score=True,
+    extra_info=None,
 ):
     """VERL RewardManager-compatible scoring.
 
@@ -321,6 +404,10 @@ def compute_score_finqa_rag(
         return 0.0, None, None
 
     exclude_doc_id = _extract_doc_id(solution_str)
+    if extra_info and not exclude_doc_id:
+        maybe_doc_id = extra_info.get("doc_id")
+        if maybe_doc_id:
+            exclude_doc_id = str(maybe_doc_id)
 
     try:
         from finqa_common.answer_normalizer import check_answer_match, post_process_answer
@@ -340,9 +427,14 @@ def compute_score_finqa_rag(
     try:
         predicted = post_process_answer(predicted, ground_truth)
         is_correct, _ = check_answer_match(predicted, ground_truth)
-        s = 1.0 if is_correct else 0.0
+        generation_score = 1.0 if is_correct else 0.0
     except Exception as e:
         print(f"[finqa_exec_acc] match error: {e}")
-        s = 0.0
+        generation_score = 0.0
 
-    return s, None, None
+    baseline_score = 1.0 if _naive_baseline_correct(question, exclude_doc_id, extra_info) else 0.0
+    if use_utility_score:
+        score = max(generation_score - baseline_score, 0.0)
+    else:
+        score = generation_score
+    return score, None, baseline_score
